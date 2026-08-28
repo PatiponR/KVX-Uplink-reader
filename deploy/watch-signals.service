@@ -1,0 +1,29 @@
+[Unit]
+Description=KVX-Uplink PLC signal watcher
+# Our own retry logic (plc/hostlink.py) handles the PLC being unreachable,
+# but wait for basic network to be up before even trying the first time.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/KVX-Uplink-reader
+ExecStart=/usr/bin/python3 /home/pi/KVX-Uplink-reader/watch_signals.py --rest
+
+# Deployment settings (REST_BASE_URL, REST_TIMEOUT -- see plc/config.py) go
+# in this file instead of here, so they aren't hardcoded into version control.
+# The leading "-" means systemd won't fail to start if the file is missing.
+EnvironmentFile=-/etc/watch-signals.env
+
+# Restart no matter how it dies, a few seconds apart so a crash loop doesn't
+# spin the CPU.
+Restart=always
+RestartSec=5
+
+# journalctl -u watch-signals -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
