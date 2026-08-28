@@ -7,9 +7,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/KVX-Uplink-reader
-ExecStart=/usr/bin/python3 /home/pi/KVX-Uplink-reader/watch_signals.py --rest
+User=shubu
+WorkingDirectory=/home/shubu/KVX-Uplink-reader
+ExecStart=/usr/bin/python3 /home/shubu/KVX-Uplink-reader/watch_signals.py --rest
 
 # Deployment settings (REST_BASE_URL, REST_TIMEOUT -- see plc/config.py) go
 # in this file instead of here, so they aren't hardcoded into version control.

@@ -1,8 +1,8 @@
 # Run on boot (Raspberry Pi / systemd)
 
-One-time setup, on the Pi, after `git clone`ing the repo into `/home/pi/KVX-Uplink-reader`
-(adjust the paths in `watch-signals.service` first if yours differs — check with
-`whoami` and `pwd`):
+One-time setup, on the Pi, after `git clone`ing the repo into `/home/shubu/KVX-Uplink-reader`
+(the unit file's `User=`/paths match that; if you clone under a different user
+or path, run `whoami` and `pwd` in the repo and edit `watch-signals.service` to match first):
 
 ```bash
 # 1. (optional) REST_BASE_URL / REST_TIMEOUT overrides for plc/config.py,
