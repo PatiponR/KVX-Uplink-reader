@@ -5,11 +5,14 @@ One-time setup, on the Pi, after `git clone`ing the repo into `/home/shubu/KVX-U
 or path, run `whoami` and `pwd` in the repo and edit `watch-signals.service` to match first):
 
 ```bash
-# 1. (optional) REST_BASE_URL / REST_TIMEOUT overrides for plc/config.py,
-#    kept outside the repo since it's deployment-specific
+# 1. REST_BASE_URL / REST_API_KEY / REST_TIMEOUT overrides for plc/config.py,
+#    kept outside the repo (this file isn't in git) since REST_API_KEY is a
+#    secret. Fill in the real key -- this is the "add it later" step.
 sudo tee /etc/watch-signals.env >/dev/null <<'EOF'
 REST_BASE_URL=http://localhost:4000
+REST_API_KEY=
 EOF
+sudo chmod 600 /etc/watch-signals.env
 
 # 2. install the unit
 sudo cp deploy/watch-signals.service /etc/systemd/system/

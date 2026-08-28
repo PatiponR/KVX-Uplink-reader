@@ -40,8 +40,9 @@ def csv_sink(path):
 
 def rest_sink(config):
     """POST every edge to `{config.base_url}/api/transactions` as
-    {"machineId": edge.name, "edge": "rise"|"fall"} -- the signal's own name
-    from plc/signals.py's SIGNALS list is used as the machineId, so each
+    {"machineId": edge.name, "edge": "rise"|"fall"}, with header
+    `x-api-key: {config.api_key}` when one is configured. The signal's own
+    name from plc/signals.py's SIGNALS list is used as the machineId, so each
     signal you add there gets posted under its own id automatically.
 
     Runs the actual HTTP calls on a background thread via a queue, so a slow
@@ -51,16 +52,19 @@ def rest_sink(config):
     add persistence here first if you need delivery guarantees).
     """
     url = config.transactions_url
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["x-api-key"] = config.api_key
+    else:
+        print("[rest_sink] warning: REST_API_KEY is not set, posting without x-api-key",
+              file=sys.stderr)
     q = queue.Queue()
 
     def worker():
         while True:
             edge = q.get()
             body = json.dumps({"machineId": edge.name, "edge": edge.event}).encode()
-            req = urllib.request.Request(
-                url, data=body, method="POST",
-                headers={"Content-Type": "application/json"},
-            )
+            req = urllib.request.Request(url, data=body, method="POST", headers=headers)
             try:
                 urllib.request.urlopen(req, timeout=config.timeout).read()
             except Exception as e:
