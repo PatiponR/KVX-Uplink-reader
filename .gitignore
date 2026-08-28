@@ -1,0 +1,14 @@
+# local-only: one-off scripts used to discover R00001/TMC-400, kept for
+# reference but not part of the deployed tool
+investigation/
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS
+.idea/
+.DS_Store
+
+# runtime output (created by --csv)
+*.csv
