@@ -21,6 +21,7 @@ display and any configured sinks. The actual logic lives in plc/:
   python3 watch_signals.py --rest           # also POST every edge, see plc/config.py
 """
 import argparse
+import sys
 import time
 
 from plc.hostlink import HostLink
@@ -38,6 +39,8 @@ def build_sinks(args):
         sinks.append(rest_sink(REST))
         print(f"[rest_sink] posting to {REST.transactions_url} "
               f"(machineId = each signal's name from plc/signals.py)")
+        print(f"[rest_sink] failed POSTs spool to {REST.spool_path} and replay "
+              f"when the API is reachable again")
     return sinks
 
 
@@ -54,6 +57,13 @@ def main():
 
     watcher = SignalWatcher(SIGNALS)
     sinks = build_sinks(args)
+
+    # display.render repaints the whole screen with ANSI escapes ~4x a second.
+    # That's the point interactively, but under systemd stdout is the journal,
+    # where it becomes hundreds of MB a day of escape sequences -- churning the
+    # SD card and burying the [rest_sink] lines you actually need to read. So
+    # only draw when there's a terminal to draw on.
+    draw = sys.stdout.isatty()
 
     recent = []
     polls = 0
@@ -78,15 +88,15 @@ def main():
             recent[:] = recent[-14:]
 
             t = time.time()
-            if t - last_draw > 0.25:
+            if draw and t - last_draw > 0.25:
                 last_draw = t
                 display.render(watcher, args.host, args.port, polls, hl.reconnects, t0, recent)
     except KeyboardInterrupt:
         print()
-        if polls:
-            display.summary(watcher, polls, t0)
-        else:
+        if not polls:
             print("interrupted before connecting")
+        elif draw:
+            display.summary(watcher, polls, t0)
     finally:
         if hl:
             hl.close()

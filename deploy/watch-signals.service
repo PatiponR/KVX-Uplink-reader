@@ -16,6 +16,14 @@ ExecStart=/usr/bin/python3 /home/shubu/KVX-Uplink-reader/watch_signals.py --rest
 # The leading "-" means systemd won't fail to start if the file is missing.
 EnvironmentFile=-/etc/watch-signals.env
 
+# Creates /var/lib/watch-signals owned by User= above and passes the path in
+# $STATE_DIRECTORY, which plc/config.py picks up as the spool location. This is
+# where edges wait out an internet outage, so it deliberately lives outside the
+# git checkout -- a `git clean` or a re-clone must not throw away undelivered
+# data. Override with REST_SPOOL_PATH in the EnvironmentFile if you want it
+# somewhere else (e.g. a USB stick to spare the SD card).
+StateDirectory=watch-signals
+
 # Restart no matter how it dies, a few seconds apart so a crash loop doesn't
 # spin the CPU.
 Restart=always

@@ -33,6 +33,55 @@ journalctl -u watch-signals -f          # live log (Ctrl-C to stop watching, ser
 journalctl -u watch-signals --since "1 hour ago"
 ```
 
+## The spool (undelivered edges)
+
+With `--rest`, any edge the API doesn't accept is written to a SQLite spool
+instead of being dropped, and replayed in order once the API is reachable
+again -- an internet outage costs nothing, and neither does a reboot in the
+middle of one. The unit's `StateDirectory=` puts it at
+`/var/lib/watch-signals/spool.db`, deliberately outside the git checkout so
+re-cloning the repo can't throw away undelivered data.
+
+```bash
+# how many edges are waiting to go out? (0 = everything delivered)
+sudo sqlite3 /var/lib/watch-signals/spool.db 'SELECT COUNT(*) FROM pending;'
+
+# edges the API rejected permanently (a 4xx that isn't 408/429) -- these are
+# set aside so one bad record can't block the queue behind it. Should be empty;
+# anything here means the body or the machineId isn't what the API expects.
+sudo sqlite3 /var/lib/watch-signals/spool.db \
+  'SELECT datetime(t,"unixepoch","localtime"), machine_id, event, reason FROM dead;'
+```
+
+Each POST carries `occurredAt` -- when the PLC actually fired -- so a replayed
+edge reports its real time rather than its delivery time. The API requires UTC
+with a literal `Z`; a `+07:00` offset or bare Bangkok local time is rejected
+with a 400, so the timestamp is built as UTC explicitly and never from
+`datetime.now()`.
+
+That makes the Pi's clock part of the data path, and a Pi has no
+battery-backed clock. Confirm NTP is actually syncing:
+
+```bash
+timedatectl show -p NTPSynchronized -p TimeUSec
+```
+
+`NTPSynchronized=yes` is what you want. If the clock is obviously unset (before
+2026) the sink omits `occurredAt` rather than sending a wrong one, and the
+server stamps the edge instead -- a degraded but honest result, logged once at
+startup. Worth knowing that a power cut while the uplink is also down is the
+case where this bites: the Pi boots with no idea what time it is and can't ask
+until WiFi returns.
+
+Retries back off from 5s to a maximum of 5 minutes between attempts. Both are
+tunable with `REST_RETRY_BASE` / `REST_RETRY_MAX` in `/etc/watch-signals.env`,
+along with `REST_SPOOL_PATH` if you'd rather the spool lived elsewhere (a USB
+stick, to spare the SD card).
+
+Sanity-check the whole thing by pointing the Pi at a dead endpoint for a
+minute -- `REST_BASE_URL=http://192.0.2.1:4000` in the env file, restart, watch
+`pending` grow in the journal, then put the real URL back and watch it drain.
+
 ## After a `git pull` with new code
 
 ```bash

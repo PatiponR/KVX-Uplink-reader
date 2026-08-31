@@ -12,3 +12,8 @@ __pycache__/
 
 # runtime output (created by --csv)
 *.csv
+
+# runtime output (created by --rest: the durable spool for failed POSTs)
+spool.db
+spool.db-wal
+spool.db-shm
