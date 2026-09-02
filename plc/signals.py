@@ -13,6 +13,14 @@ from dataclasses import dataclass, field
 SIGNALS = [
     # name   dev   chan  bit
     ("TMC-400", "R",  0,    1),
+    ("TMC-200", "R",  0,    3),
+    ("B1-160", "R",  0,    2),
+    ("B2-160", "R",  0,    4),
+    ("B3-110", "R",  0,    5),
+    ("B4-110", "R",  0,    6),
+    ("B5-110", "R",  0,    9),
+    ("B6-80", "R",  0,    11),
+    ("C1-200", "R",  0,    10),
 ]
 
 
