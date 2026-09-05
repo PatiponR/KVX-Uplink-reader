@@ -1,5 +1,20 @@
 # Run on boot (Raspberry Pi / systemd)
 
+## Fresh Pi? Use the script
+
+`deploy/setup-pi.sh` does everything below plus the network setup, in one
+idempotent pass -- safe to re-run, and it verifies itself at the end:
+
+```bash
+git clone https://github.com/PatiponR/KVX-Uplink-reader.git
+cd KVX-Uplink-reader && ./deploy/setup-pi.sh
+```
+
+It prompts for `REST_API_KEY` (hidden) and leaves an existing one alone. The
+rest of this file is the manual version, and what to check when something
+misbehaves.
+
+
 One-time setup, on the Pi, after `git clone`ing the repo into `/home/shubu/KVX-Uplink-reader`
 (the unit file's `User=`/paths match that; if you clone under a different user
 or path, run `whoami` and `pwd` in the repo and edit `watch-signals.service` to match first):
