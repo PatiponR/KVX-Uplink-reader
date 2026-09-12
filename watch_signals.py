@@ -9,7 +9,8 @@ This file is just the CLI: connect, poll in a loop, hand every edge to the
 display and any configured sinks. The actual logic lives in plc/:
 
   plc/hostlink.py  transport (talks host-link)
-  plc/signals.py   SIGNALS registry + edge detection (add signals here)
+  plc/signals.py   SIGNALS / SERVICE_SIGNALS registries + edge detection
+                   (add signals here)
   plc/display.py   terminal rendering
   plc/config.py    deployment settings (REST base URL, machine ID, ...)
   plc/sinks.py     pluggable outputs -- CSV and a REST POST today; adding
@@ -25,7 +26,7 @@ import sys
 import time
 
 from plc.hostlink import HostLink
-from plc.signals import SignalWatcher, SIGNALS
+from plc.signals import SignalWatcher, ALL_SIGNALS
 from plc.sinks import csv_sink, rest_sink
 from plc.config import REST
 from plc import display
@@ -55,7 +56,7 @@ def main():
                      help="seconds between reconnect attempts while the PLC is unreachable (default 5)")
     args = ap.parse_args()
 
-    watcher = SignalWatcher(SIGNALS)
+    watcher = SignalWatcher(ALL_SIGNALS)
     sinks = build_sinks(args)
 
     # display.render repaints the whole screen with ANSI escapes ~4x a second.

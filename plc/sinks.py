@@ -139,11 +139,13 @@ def _count(conn):
 
 def rest_sink(config):
     """POST every edge to `{config.base_url}/api/transactions` as
-    {"machineId": edge.name, "edge": "rise"|"fall", "occurredAt": <UTC ISO Z>},
+    {"machineId": edge.name, "edge": <event>, "occurredAt": <UTC ISO Z>},
     with header
-    `x-api-key: {config.api_key}` when one is configured. The signal's own
-    name from plc/signals.py's SIGNALS list is used as the machineId, so each
-    signal you add there gets posted under its own id automatically.
+    `x-api-key: {config.api_key}` when one is configured. <event> is
+    "rise"/"fall" for a plc/signals.py SIGNALS entry, or "service"/"operate"
+    for a SERVICE_SIGNALS entry (see plc/signals.py). The signal's own name
+    is used as the machineId, so each signal you add gets posted under its
+    own id automatically.
 
     Nothing is dropped when the API is unreachable. An edge whose POST fails
     is written to a SQLite spool (config.spool_path) and retried with

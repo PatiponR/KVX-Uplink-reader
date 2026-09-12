@@ -33,16 +33,31 @@ SIGNALS = [
     ("C6-60", "R",  3,    1),
     ("C7-60", "R",  3,    2),
     ("C8-80", "R",  3,    3),
-    
 ]
+
+# Same shape as SIGNALS -- a plain 24V digital bit on the PLC, watched and
+# CSV-logged exactly the same way. The only difference is what rest_sink
+# posts for the "edge" field: "service" on rising edge and "operate" on
+# falling edge, instead of "rise"/"fall". Add entries here (not to SIGNALS)
+# for pins that need that labeling.
+SERVICE_SIGNALS = [
+    # name   dev   chan  bit
+]
+
+# All watched signals, combined -- what SignalWatcher polls by default.
+ALL_SIGNALS = SIGNALS + SERVICE_SIGNALS
+
+# name -> (rise_event, fall_event) for the SERVICE_SIGNALS names; anything
+# not in here falls back to the normal "rise"/"fall" pair in poll() below.
+_SERVICE_EVENTS = {name: ("service", "operate") for name, *_ in SERVICE_SIGNALS}
 
 
 @dataclass
 class Edge:
     t: float
     name: str
-    event: str              # "rise" | "fall"
-    width: float | None     # only set on "fall"
+    event: str              # "rise" | "fall", or "service" | "operate" for SERVICE_SIGNALS
+    width: float | None     # only set on the falling-edge event
     count: int              # rise count so far, including this edge
 
 
@@ -84,7 +99,7 @@ class SignalWatcher:
     """Tracks a fixed set of named signals and turns raw channel words into edges."""
 
     def __init__(self, signals=None):
-        self.signals = signals if signals is not None else SIGNALS
+        self.signals = signals if signals is not None else ALL_SIGNALS
         self.state = {name: SignalState(dev, chan, bit) for name, dev, chan, bit in self.signals}
         self.channels = sorted({(dev, chan) for _, dev, chan, _ in self.signals})
         self.ranges = make_ranges(self.channels)
@@ -112,15 +127,16 @@ class SignalWatcher:
             if st.level is None:
                 st.level = lvl
             elif pw is not None and (pw >> bit & 1) != lvl:
+                rise_event, fall_event = _SERVICE_EVENTS.get(name, ("rise", "fall"))
                 if lvl:  # rising edge
                     st.rise_t = t
                     st.count += 1
-                    edges.append(Edge(t, name, "rise", None, st.count))
+                    edges.append(Edge(t, name, rise_event, None, st.count))
                 else:    # falling edge
                     wd = t - st.rise_t if st.rise_t else None
                     if wd:
                         st.widths.append(wd)
-                    edges.append(Edge(t, name, "fall", wd, st.count))
+                    edges.append(Edge(t, name, fall_event, wd, st.count))
                 st.level = lvl
 
         for ch in self.channels:
