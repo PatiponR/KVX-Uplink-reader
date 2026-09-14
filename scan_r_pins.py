@@ -16,11 +16,11 @@ import sys
 import time
 
 from plc.hostlink import HostLink
-from plc.signals import ALL_SIGNALS
+from plc.signals import SIGNALS
 
 CHUNK = 16  # channels per RDS call
 
-_NAMES = {(dev, chan, bit): name for name, dev, chan, bit in ALL_SIGNALS}
+_NAMES = {(dev, chan, bit): name for name, dev, chan, bit in SIGNALS}
 
 
 def label(dev, chan, bit):
