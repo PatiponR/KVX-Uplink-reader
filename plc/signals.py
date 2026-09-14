@@ -42,14 +42,38 @@ SIGNALS = [
 # for pins that need that labeling.
 SERVICE_SIGNALS = [
     # name   dev   chan  bit
+
+    # KV-B16X*[2] / KV-B16X*[3] -- the two new 16-input expansion units,
+    # start relay R33000 / R34000 per KV STUDIO's unit monitor (word 330 /
+    # 340, not 33 / 34 -- Keyence relay numbers split word(3 digits) +
+    # bit(2 digits)).
+    ("TMC-400", "R", 330,    0),
+    ("TMC-200", "R", 330,    1),
+    ("B1-160", "R", 330,    2),
+    ("B2-160", "R", 330,    3),
+    ("B3-110", "R", 330,    4),
+    ("B4-110", "R", 330,    5),
+    ("B5-110", "R", 330,    6),
+    ("B6-80", "R", 330,    7),
+    ("B7-60", "R", 330,    8),
+    ("B8-45", "R", 330,    9),
+    ("B9-60", "R", 330,   10),
+    ("B10-60", "R", 330,   11),
+    ("C1-200", "R", 330,   12),
+    ("C2-160", "R", 330,   13),
+    ("C3-160", "R", 330,   14),
+    ("C4-160", "R", 330,   15),
 ]
 
 # All watched signals, combined -- what SignalWatcher polls by default.
 ALL_SIGNALS = SIGNALS + SERVICE_SIGNALS
 
-# name -> (rise_event, fall_event) for the SERVICE_SIGNALS names; anything
-# not in here falls back to the normal "rise"/"fall" pair in poll() below.
-_SERVICE_EVENTS = {name: ("service", "operate") for name, *_ in SERVICE_SIGNALS}
+# (dev, chan, bit) -> (rise_event, fall_event) for SERVICE_SIGNALS entries;
+# anything not in here falls back to the normal "rise"/"fall" pair in poll()
+# below. Keyed by address, not name -- a name (machineId) can appear in both
+# SIGNALS and SERVICE_SIGNALS for the same machine, and only the
+# SERVICE_SIGNALS occurrence should get "service"/"operate".
+_SERVICE_EVENTS = {(dev, chan, bit): ("service", "operate") for _, dev, chan, bit in SERVICE_SIGNALS}
 
 
 @dataclass
@@ -63,6 +87,7 @@ class Edge:
 
 @dataclass
 class SignalState:
+    name: str
     dev: str
     chan: int
     bit: int
@@ -100,7 +125,12 @@ class SignalWatcher:
 
     def __init__(self, signals=None):
         self.signals = signals if signals is not None else ALL_SIGNALS
-        self.state = {name: SignalState(dev, chan, bit) for name, dev, chan, bit in self.signals}
+        # Keyed by physical address, not name -- a name (machineId) may
+        # legitimately appear twice (e.g. a machine's run signal in SIGNALS
+        # and its service signal in SERVICE_SIGNALS at a different address),
+        # and each needs its own independently-tracked state.
+        self.state = {(dev, chan, bit): SignalState(name, dev, chan, bit)
+                      for name, dev, chan, bit in self.signals}
         self.channels = sorted({(dev, chan) for _, dev, chan, _ in self.signals})
         self.ranges = make_ranges(self.channels)
         self._prev_word = {ch: None for ch in self.channels}
@@ -123,11 +153,11 @@ class SignalWatcher:
             w = words[(dev, chan)]
             pw = self._prev_word[(dev, chan)]
             lvl = w >> bit & 1
-            st = self.state[name]
+            st = self.state[(dev, chan, bit)]
             if st.level is None:
                 st.level = lvl
             elif pw is not None and (pw >> bit & 1) != lvl:
-                rise_event, fall_event = _SERVICE_EVENTS.get(name, ("rise", "fall"))
+                rise_event, fall_event = _SERVICE_EVENTS.get((dev, chan, bit), ("rise", "fall"))
                 if lvl:  # rising edge
                     st.rise_t = t
                     st.count += 1
