@@ -11,12 +11,12 @@ def render(watcher, host, port, polls, reconnects, t0, recent):
         f"  {up:7.1f}s   {polls} polls ({polls/up:.0f}/s)   reconnects {reconnects}",
         "",
     ]
-    for name, st in watcher.state.items():
+    for st in watcher.state.values():
         ws = st.widths
         stat = (f"avg {sum(ws)/len(ws)*1000:6.0f}ms  "
                 f"min {min(ws)*1000:5.0f}  max {max(ws)*1000:5.0f}") if ws else ""
         lvl = st.level or 0
-        out.append(f"  \033[1m{name:<12}\033[0m {st.label:<9} "
+        out.append(f"  \033[1m{st.name:<12}\033[0m {st.label:<9} "
                    f"{'\033[92mON \033[0m' if lvl else 'off'}  "
                    f"count \033[1m{st.count:6d}\033[0m   {stat}")
 
@@ -35,11 +35,11 @@ def render(watcher, host, port, polls, reconnects, t0, recent):
 def summary(watcher, polls, t0):
     up = time.time() - t0
     print(f"\n\n=== {up:.1f}s, {polls} polls ({polls/up:.0f}/s) ===")
-    for name, st in watcher.state.items():
+    for st in watcher.state.values():
         if st.count:
             ws = st.widths
-            print(f"  {name} ({st.label}): {st.count} pulses  ({st.count/up*60:.1f}/min)"
+            print(f"  {st.name} ({st.label}): {st.count} pulses  ({st.count/up*60:.1f}/min)"
                   + (f"  width avg {sum(ws)/len(ws)*1000:.0f}ms "
                      f"min {min(ws)*1000:.0f} max {max(ws)*1000:.0f}" if ws else ""))
         else:
-            print(f"  {name} ({st.label}): no pulses seen")
+            print(f"  {st.name} ({st.label}): no pulses seen")
