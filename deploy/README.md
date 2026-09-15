@@ -64,6 +64,26 @@ problem is downstream (service, REST, API). `scan` finds inputs that are
 changing on a bit `signals.py` doesn't map, which usually means something
 was rewired.
 
+To see what actually gets sent to the API, turn on request logging. Add
+`REST_LOG_REQUESTS=1` to `/etc/watch-signals.env`, then:
+
+```bash
+sudo systemctl restart watch-signals
+journalctl -u watch-signals -f | grep TMC-400
+```
+
+Each POST is one `[http]` line: the JSON body, the HTTP status, the API's
+response and how long it took. Reading the result:
+
+- **No line for the machine:** its edges never reached the sink. Check its
+  pins in `signals.py` and that the service was restarted after editing them.
+- **`HTTP 4xx` with a response:** the API rejected the edge, and the response
+  says why.
+- **`queued behind N spooled edge(s)`:** the edge is waiting in the spool
+  behind a backlog.
+
+Remove the line (and restart) when you're done, to keep the journal small.
+
 ## The spool (undelivered edges)
 
 With `--rest`, any edge the API doesn't accept is written to a SQLite spool

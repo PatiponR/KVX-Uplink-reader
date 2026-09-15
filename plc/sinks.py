@@ -137,6 +137,12 @@ def _count(conn):
     return conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
 
 
+def _one_line(data, limit=300):
+    """A response body squeezed onto one line and capped, for log lines."""
+    text = " ".join(data.decode("utf-8", "replace").split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def rest_sink(config):
     """POST every edge to `{config.base_url}/api/transactions` as
     {"machineId": edge.name, "edge": <event>, "occurredAt": <UTC ISO Z>},
@@ -167,6 +173,12 @@ def rest_sink(config):
     The spool stores that time alongside the edge, so a replay after a two-hour
     outage still reports when the edge really happened rather than when it was
     finally delivered.
+
+    With config.log_requests on, every POST is logged to stderr (the journal
+    under systemd) as one line: body, status, response and time taken. Edges
+    held back behind a backlog are logged too, so an edge that never shows up
+    in that log never reached this sink at all. Failures are logged either
+    way, including the API's response body.
     """
     url = config.transactions_url
     headers = {"Content-Type": "application/json"}
@@ -186,19 +198,45 @@ def rest_sink(config):
             payload["occurredAt"] = occurred_at
         body = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        started = time.monotonic()
+
+        def log(outcome, response=b""):
+            # One line per request with the machineId in it, so
+            # `journalctl -u watch-signals | grep TMC-400` is that machine's history.
+            ms = (time.monotonic() - started) * 1000
+            print(f"[http] POST {url} {body.decode()} -> {outcome} in {ms:.0f} ms"
+                  + (f": {_one_line(response)}" if response else ""), file=sys.stderr)
+
         try:
             with urllib.request.urlopen(req, timeout=config.timeout) as r:
-                r.read()
+                response = r.read()
+            if config.log_requests:
+                # urllib follows a 301/302 by re-sending as a GET without the
+                # body -- a "success" that created nothing. Make that visible.
+                moved = f" (redirected to {r.url})" if r.url != url else ""
+                log(f"HTTP {r.status}{moved}", response)
             return True, None
         except urllib.error.HTTPError as e:
+            try:
+                response = e.read()
+            except Exception:
+                response = b""
+            if config.log_requests:
+                log(f"HTTP {e.code}", response)
             # 408/429 are "try again"; every other 4xx means this exact body
-            # will be rejected forever, however long we wait.
+            # will be rejected forever, however long we wait. Keep the API's
+            # own explanation -- it's what tells you what's wrong with the body.
             if 400 <= e.code < 500 and e.code not in (408, 429):
-                return False, f"HTTP {e.code}"
-            print(f"[rest_sink] POST to {url} failed: HTTP {e.code}", file=sys.stderr)
+                return False, (f"HTTP {e.code}: {_one_line(response)}" if response else f"HTTP {e.code}")
+            if not config.log_requests:
+                print(f"[rest_sink] POST to {url} failed: HTTP {e.code}"
+                      + (f": {_one_line(response)}" if response else ""), file=sys.stderr)
             return False, None
         except Exception as e:
-            print(f"[rest_sink] POST to {url} failed: {e}", file=sys.stderr)
+            if config.log_requests:
+                log(f"failed ({e})")
+            else:
+                print(f"[rest_sink] POST to {url} failed: {e}", file=sys.stderr)
             return False, None
 
     def drain(conn):
@@ -245,6 +283,9 @@ def rest_sink(config):
                 if backlog:
                     _spool(conn, edge.t, edge.name, edge.event)
                     backlog += 1
+                    if config.log_requests:
+                        print(f"[http] {edge.name}/{edge.event} not sent yet: queued behind "
+                              f"{backlog - 1} spooled edge(s)", file=sys.stderr)
                 else:
                     delivered, permanent = post(edge.t, edge.name, edge.event)
                     if permanent:

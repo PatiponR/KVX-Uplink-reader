@@ -20,6 +20,9 @@ display and any configured sinks. The actual logic lives in plc/:
   python3 watch_signals.py                  # live view
   python3 watch_signals.py --csv edges.csv  # also append every edge to CSV
   python3 watch_signals.py --rest           # also POST every edge, see plc/config.py
+  python3 watch_signals.py --rest --log-http 2>>http.log
+                                            # ...and log every request/response
+                                            # (stderr, so it doesn't fight the live view)
 """
 import argparse
 import sys
@@ -36,8 +39,15 @@ def build_sinks(args):
     sinks = []
     if args.csv:
         sinks.append(csv_sink(args.csv))
+    if args.log_http:
+        REST.log_requests = True
+        if not args.rest:
+            print("[rest_sink] --log-http does nothing without --rest", file=sys.stderr)
     if args.rest:
         sinks.append(rest_sink(REST))
+        if REST.log_requests:
+            print(f"[rest_sink] logging every request to stderr "
+                  f"(x-api-key {'set' if REST.api_key else 'NOT set'})", file=sys.stderr)
         print(f"[rest_sink] posting to {REST.transactions_url} "
               f"(machineId = each signal's name from plc/signals.py)")
         print(f"[rest_sink] failed POSTs spool to {REST.spool_path} and replay "
@@ -52,6 +62,9 @@ def main():
     ap.add_argument("--csv", help="append one row per edge")
     ap.add_argument("--rest", action="store_true",
                      help="POST every edge to REST_BASE_URL/api/transactions (see plc/config.py)")
+    ap.add_argument("--log-http", action="store_true",
+                     help="log every REST request and response to stderr "
+                          "(same as REST_LOG_REQUESTS=1)")
     ap.add_argument("--retry-interval", type=float, default=5,
                      help="seconds between reconnect attempts while the PLC is unreachable (default 5)")
     args = ap.parse_args()
