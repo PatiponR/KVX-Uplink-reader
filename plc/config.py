@@ -54,6 +54,11 @@ class RestConfig:
     retry_base: float = float(_env("REST_RETRY_BASE", "5"))
     retry_max: float = float(_env("REST_RETRY_MAX", "300"))
 
+    # Log every outgoing POST (body, status, response, time) -- for tracking
+    # down why one machine's edges never reach the API. Off by default so the
+    # journal stays quiet; failures are logged regardless.
+    log_requests: bool = _env("REST_LOG_REQUESTS", "0").lower() in ("1", "true", "yes", "on")
+
     @property
     def transactions_url(self):
         return f"{self.base_url.rstrip('/')}/api/transactions"
