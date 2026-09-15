@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 SIGNALS = [
     # name   dev   chan  bit
-    ("TMC-400", "R",  1,    0),
+    ("TMC-400", "R",  0,    0),
     ("TMC-200", "R",  0,    1),
     ("B1-160", "R",  0,    2),
     ("B2-160", "R",  0,    3),
@@ -46,7 +46,7 @@ SIGNALS = [
 # for pins that need that labeling.
 SERVICE_SIGNALS = [
     # name   dev   chan  bit
-    ("TMC-400", "R",  0,    0),
+    ("TMC-400", "R",  1,    0),
     ("TMC-200", "R",  1,    1),
     ("B1-160", "R",  1,    2),
     ("B2-160", "R",  1,    3),
