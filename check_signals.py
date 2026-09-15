@@ -55,6 +55,20 @@ PROD_RANGES = make_ranges({(d, c) for _, d, c, _ in ALL_SIGNALS})
 
 KNOWN_DEVICES = {"R", "MR", "LR", "CR", "B", "DM", "EM", "FM", "W", "ZF", "TM"}
 
+# Relays are numbered channel * 100 + bit (R00100 = channel 1, bit 0), and RDS
+# takes that relay number as its start: "RDS R1.U 1" is the 16 relays from
+# R00001 to R00100 -- NOT channel 1. Channel n starts at relay n * 100.
+RELAY_DEVICES = {"R", "MR", "LR", "CR"}
+
+
+def chan_addr(dev, chan):
+    """The RDS start address that reads channel `chan` as one aligned 16-bit word."""
+    return f"{dev}{chan * 100}" if dev in RELAY_DEVICES else f"{dev}{chan}"
+
+
+def chan_name(dev, chan):
+    return f"{dev}{chan:03d}xx"
+
 PLC_ERRORS = {
     "E0": "device number error -- that device/channel doesn't exist on this PLC",
     "E1": "command error -- the PLC didn't understand the command",
@@ -157,10 +171,10 @@ class Link(HostLink):
         return buf.decode("ascii", "replace").strip()
 
 
-def read_words(link, dev, start, n=1):
-    """RDS n words starting at dev/start -- same command watch_signals.py sends.
+def read_words(link, addr, n=1):
+    """RDS n 16-bit words starting at `addr` (e.g. "R100", see chan_addr).
     Returns (values, None) or (None, what went wrong). A dead link raises OSError."""
-    reply = link.ask(f"RDS {dev}{start}.U {n}")
+    reply = link.ask(f"RDS {addr}.U {n}")
     parts = reply.split()
     if len(parts) == n and all(p.isdigit() for p in parts):
         return [int(p) for p in parts], None
@@ -293,7 +307,7 @@ def run_loop(session, tracker, seconds, on_edge):
     tracker.t0 = time.time()
     end = tracker.t0 + seconds if seconds else None
     span = f"{seconds:g}s" if seconds else "until Ctrl-C"
-    print(grey(f"  polling {', '.join(f'{d}{c}' for d, c in tracker.channels)} for {span} "
+    print(grey(f"  polling {', '.join(chan_name(d, c) for d, c in tracker.channels)} for {span} "
                f"(Ctrl-C stops early and still prints the summary)"), flush=True)
     try:
         while end is None or time.time() < end:
@@ -302,7 +316,7 @@ def run_loop(session, tracker, seconds, on_edge):
                 continue
             for key in tracker.channels:
                 try:
-                    vals, err = read_words(session.link, *key)
+                    vals, err = read_words(session.link, chan_addr(*key))
                 except OSError as e:
                     tracker.link_drops += 1
                     print(f"  {time.time() - tracker.t0:8.2f}s  {red('link dropped')}: {e} -- reconnecting",
@@ -312,7 +326,7 @@ def run_loop(session, tracker, seconds, on_edge):
                 if err:
                     if not tracker.errors[key]:
                         print(f"  {time.time() - tracker.t0:8.2f}s  {red('read failed')} "
-                              f"{key[0]}{key[1]}: {err}", flush=True)
+                              f"{chan_name(*key)}: {err}", flush=True)
                     tracker.errors[key] += 1
                     tracker.last_error[key] = err
                     continue
@@ -360,7 +374,7 @@ def summarize_signals(report, tracker, entries):
         print(f"  {name:<12} {kind:<8} {label(*k):<7} {tracker.rises[k]:>6}  {width:<21} {status}")
 
     for (dev, chan), n in sorted(tracker.errors.items()):
-        report.error(f"{dev}{chan}: {n} failed read(s) -- last: {tracker.last_error[(dev, chan)]}")
+        report.error(f"{chan_name(dev, chan)}: {n} failed read(s) -- last: {tracker.last_error[(dev, chan)]}")
     if no_data:
         report.error(f"never got a value for: {', '.join(no_data)}")
     if tracker.link_drops:
@@ -435,29 +449,35 @@ def read_levels(session, report, entries):
     words = {}
 
     heading("channel reads, one at a time")
-    print(grey(f"  {'chan':<5} {'bit 15 ...... bit 0':<19}  ON bits (* = not in signals.py)"))
+    print(grey(f"  {'chan':<7} {'bit 15 ...... bit 0':<19}  ON bits (* = not in signals.py)"))
     for dev, chan in channels:
         try:
-            vals, err = read_words(link, dev, chan)
+            vals, err = read_words(link, chan_addr(dev, chan))
         except OSError as e:
-            report.error(f"link dropped while reading {dev}{chan}: {e}")
+            report.error(f"link dropped while reading {chan_name(dev, chan)}: {e}")
             return words, True
         if err:
             names = sorted({n for n, _, d, c, _ in ENTRIES if (d, c) == (dev, chan)})
-            report.error(f"{dev}{chan}: {err}")
+            report.error(f"{chan_name(dev, chan)} (RDS {chan_addr(dev, chan)}.U 1): {err}")
             report.hint(f"no data for anything on this channel: {', '.join(names)}")
             continue
         w = words[(dev, chan)] = vals[0]
         binary = " ".join(f"{w:016b}"[i:i + 4] for i in range(0, 16, 4))
         on = [str(b) if (dev, chan, b) in ADDR else yellow(f"{b}*") for b in range(16) if w >> b & 1]
-        print(f"  {dev + str(chan):<5} {binary}  {', '.join(on) or grey('none')}")
+        print(f"  {chan_name(dev, chan):<7} {binary}  {', '.join(on) or grey('none')}")
 
     heading("batched reads, exactly as watch_signals.py sends them")
     batch_failed = False
     for dev, start, n in PROD_RANGES:
         cmd = f"RDS {dev}{start}.U {n}"
+        if chan_addr(dev, start) != f"{dev}{start}":
+            # plc/hostlink.py sends the channel number as the start address, which
+            # is only aligned for channel 0 -- see RELAY_DEVICES above.
+            batch_failed = True
+            report.error(f"{cmd} starts at relay {label(dev, start // 100, start % 100)}, not "
+                         f"{chan_name(dev, start)} -- watch_signals.py reads the wrong bits here")
         try:
-            vals, err = read_words(link, dev, start, n)
+            vals, err = read_words(link, f"{dev}{start}", n)
         except OSError as e:
             report.error(f"link dropped on {cmd}: {e}")
             return words, True
@@ -579,9 +599,10 @@ def cmd_scan(args):
     heading(f"scan result after {tracker.elapsed:.0f}s ({tracker.polls} polls) -- quiet unmapped bits hidden")
     for dev, chan in tracker.channels:
         if (dev, chan) not in tracker.words:
-            report.error(f"{dev}{chan}: never read successfully -- {tracker.last_error.get((dev, chan), 'link down')}")
+            report.error(f"{chan_name(dev, chan)}: never read successfully -- "
+                         f"{tracker.last_error.get((dev, chan), 'link down')}")
             continue
-        print(f"  {bold(dev + str(chan))}")
+        print(f"  {bold(chan_name(dev, chan))}")
         shown = 0
         for bit in range(16):
             k = (dev, chan, bit)
@@ -605,7 +626,7 @@ def cmd_scan(args):
             quiet = [n for n, kd, d, c, b in ENTRIES
                      if (d, c) == (dev, chan) and kd == "run" and not tracker.changes((d, c, b))]
             if quiet:
-                report.hint(f"{dev}{chan} also has quiet run signals: {', '.join(quiet)} -- was an input moved?")
+                report.hint(f"{chan_name(dev, chan)} also has quiet run signals: {', '.join(quiet)} -- was an input moved?")
     else:
         report.ok("no unmapped bits changed")
     on_unmapped = [label(d, c, b) for d, c in tracker.channels for b in range(16)
