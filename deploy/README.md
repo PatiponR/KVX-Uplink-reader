@@ -48,6 +48,22 @@ journalctl -u watch-signals -f          # live log (Ctrl-C to stop watching, ser
 journalctl -u watch-signals --since "1 hour ago"
 ```
 
+## Debugging a machine with no data
+
+`check_signals.py` checks the PLC side against `plc/signals.py`, one layer at
+a time: mapping, network, PLC mode, channel reads, bit levels, live edges.
+It's read-only and safe to run while the service is running:
+
+```bash
+python3 check_signals.py machine B8-45      # start here: ends with a verdict
+python3 check_signals.py                    # or pick a mode from the menu
+```
+
+If it shows the machine's signal toggling, the PLC side is fine and the
+problem is downstream (service, REST, API). `scan` finds inputs that are
+changing on a bit `signals.py` doesn't map, which usually means something
+was rewired.
+
 ## The spool (undelivered edges)
 
 With `--rest`, any edge the API doesn't accept is written to a SQLite spool
