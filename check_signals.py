@@ -20,6 +20,7 @@ is downstream (the watch-signals service, REST, the API).
   python3 check_signals.py snapshot                # read every signal's level once
   python3 check_signals.py watch -m B8-45 -s 120   # live edges, flags stuck signals
   python3 check_signals.py scan --channels 0-4     # find active bits NOT in signals.py
+  python3 check_signals.py discover --channels 0-19 -s 300  # hunt for new signals to add
 
 Common options: --host, --port, --timeout, -s/--seconds (0 = until Ctrl-C),
 --no-color. Safe to run while the watch-signals service is running.
@@ -638,6 +639,65 @@ def cmd_scan(args):
     return finish(report)
 
 
+def cmd_discover(args):
+    """Listen on a range of channels for bits that change but aren't in
+    signals.py yet, and print ready-to-paste lines for the ones found."""
+    report = Report()
+    channels = {(args.dev, c) for c in args.channels}
+    session = Session(args, report)
+    if not session.open():
+        return finish(report)
+
+    span = f"{chan_name(*min(channels))} .. {chan_name(*max(channels))}"
+    heading(f"listening for new signals on {span} -- only bits NOT in signals.py are shown")
+    print(grey("  trigger the machine / input you're looking for now"))
+    tracker = Tracker(channels)
+    first_seen = {}
+
+    def on_edge(k, event, width, t):
+        if k not in ADDR:
+            first_seen.setdefault(k, t)
+            edge_line(tracker, k, event, width, t)
+
+    run_loop(session, tracker, args.seconds, on_edge)
+    session.close()
+
+    heading(f"new signal candidates after {tracker.elapsed:.0f}s ({tracker.polls} polls)")
+    unreadable = [key for key in tracker.channels if key not in tracker.words]
+    if len(unreadable) == len(tracker.channels):
+        report.error("no channel could be read -- " + tracker.last_error.get(unreadable[0], "link down"))
+        return finish(report)
+    if unreadable:
+        report.note("skipped channels the PLC wouldn't read (probably don't exist): "
+                    + ", ".join(chan_name(*key) for key in unreadable))
+
+    found = unmapped_active(tracker)
+    if found:
+        print(grey(f"  {'addr':<7} {'pulses':>6}  {'width avg/min/max ms':<21} {'first seen':>10}  now"))
+        for k in found:
+            ws = tracker.widths[k]
+            width = (f"{sum(ws) / len(ws) * 1000:.0f}/{min(ws) * 1000:.0f}/{max(ws) * 1000:.0f}"
+                     if ws else "-")
+            now = "ON" if tracker.level(*k) else "off"
+            print(f"  {yellow(label(*k)):<7} {tracker.rises[k]:>6}  {width:<21} "
+                  f"{first_seen[k] - tracker.t0:>9.1f}s  {now}")
+        report.warn(f"{len(found)} unmapped bit(s) changed -- candidates for new signals")
+        print(grey("\n  to start watching them, rename and paste into SIGNALS (or SERVICE_SIGNALS) in plc/signals.py:"))
+        for d, c, b in found:
+            print(f'    ("NEW-{label(d, c, b)}", "{d}",  {c},   {b:>2}),')
+    else:
+        report.ok("no unmapped bits changed")
+        report.hint("nothing new seen -- make sure the input was triggered during the scan, "
+                    "or widen --channels / use a longer -s")
+
+    steady_on = [label(*key, b) for key in tracker.channels if key in tracker.words for b in range(16)
+                 if (*key, b) not in ADDR and tracker.level(*key, b) and not tracker.changes((*key, b))]
+    if steady_on:
+        report.note(f"unmapped bits that stayed ON the whole time (may be a signal that never toggled): "
+                    f"{', '.join(steady_on)}")
+    return finish(report)
+
+
 def cmd_machine(args):
     report = Report()
     heading(f"machine {args.name}")
@@ -756,6 +816,13 @@ def build_parser():
     p.add_argument("--dev", default="R", help="device for --channels (default R)")
     p.set_defaults(func=cmd_scan)
 
+    p = sub.add_parser("discover", parents=[common, timed],
+                       help="scan for NEW signals: changing bits not in signals.py yet")
+    p.add_argument("--channels", type=parse_channels, default="0-9",
+                   help="channels to listen on, e.g. 0-19 (default 0-9)")
+    p.add_argument("--dev", default="R", help="device for --channels (default R)")
+    p.set_defaults(func=cmd_discover)
+
     p = sub.add_parser("snapshot", parents=[common], help="read every signal's current level once")
     p.set_defaults(func=cmd_snapshot)
 
@@ -769,6 +836,7 @@ MENU = [
     ("check",    "Quick health check       mapping + connection + current levels"),
     ("watch",    "Watch live edges         flags signals that never change"),
     ("scan",     "Scan for unmapped bits   finds inputs that moved off their mapped bit"),
+    ("discover", "Scan for new signals     changing bits not in signals.py yet"),
     ("snapshot", "Read current levels once"),
     ("config",   "Check signals.py only    no PLC needed"),
 ]
@@ -820,11 +888,16 @@ def menu():
             extra = _ask("extra channels to scan, e.g. 0-9 (blank = only mapped ones)")
             if extra:
                 argv += ["--channels", extra]
+        if mode == "discover":
+            argv += ["--channels", _ask("channels to listen on", "0-9")]
+            dev = _ask("device", "R")
+            if dev != "R":
+                argv += ["--dev", dev]
         if mode != "config":
             host = _ask("PLC host", DEFAULT_HOST)
             if host != DEFAULT_HOST:
                 argv += ["--host", host]
-        if mode in ("machine", "watch", "scan"):
+        if mode in ("machine", "watch", "scan", "discover"):
             argv += ["-s", _ask("seconds to watch (0 = until Ctrl-C)", 60)]
 
         print(grey("  same as: python3 check_signals.py " + " ".join(argv)))
