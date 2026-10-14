@@ -36,7 +36,13 @@ SIGNALS = [
     
     ("A3-60", "R",  2,    8),
     ("A4-60", "R",  2,    9),
-    ("B12-60", "R",  2,   10)
+
+    ("B11-SPOT", "R", 2,    13),
+    ("B12-TARP", "R", 2,    14),
+    ("B13-TARP", "R", 2,    15),
+
+    ("H1-SPOT", "R", 3,    0),
+    ("H2-SPOT", "R", 3,    2),
 ]
 
 # Same shape as SIGNALS -- a plain 24V digital bit on the PLC, watched and
@@ -69,7 +75,9 @@ SERVICE_SIGNALS = [
     ("C8-80", "R",  1,    11),
     
     ("A3-60", "R",  2,    12),
-    ("A4-60", "R",  2,    13),
+    ("A4-60", "R",  2,    10),
+
+    ("H1-SPOT", "R", 3,    1),
 ]
 # All watched signals, combined -- what SignalWatcher polls by default.
 ALL_SIGNALS = SIGNALS + SERVICE_SIGNALS
