@@ -72,66 +72,102 @@ sudo systemctl restart watch-signals
 journalctl -u watch-signals -f | grep TMC-400
 ```
 
-Each POST is one `[http]` line: the JSON body, the HTTP status, the API's
+Each request is one `[http]` line: how many edges, the HTTP status, the API's
 response and how long it took. Reading the result:
 
 - **No line for the machine:** its edges never reached the sink. Check its
   pins in `signals.py` and that the service was restarted after editing them.
 - **`HTTP 4xx` with a response:** the API rejected the edge, and the response
   says why.
-- **`queued behind N spooled edge(s)`:** the edge is waiting in the spool
-  behind a backlog.
 
 Remove the line (and restart) when you're done, to keep the journal small.
 
-## The spool (undelivered edges)
+## Batched sending and the spool
 
-With `--rest`, any edge the API doesn't accept is written to a SQLite spool
-instead of being dropped, and replayed in order once the API is reachable
-again -- an internet outage costs nothing, and neither does a reboot in the
-middle of one. The unit's `StateDirectory=` puts it at
-`/var/lib/watch-signals/spool.db`, deliberately outside the git checkout so
-re-cloning the repo can't throw away undelivered data.
+With `--rest`, edges are sent in batches to `POST /api/transactions/batch`: one
+request carries everything that is waiting (up to `REST_BATCH_MAX`, default 200).
+One request per edge capped throughput at ~12 edges/s over the ~80 ms link to
+Singapore, so the dashboard fell further behind all day. The contract and the
+reasoning are in `PI-SENDER-BATCH-REQUIREMENTS.md`.
+
+Every edge is written to a SQLite spool *before* any network attempt and removed
+only after the API answers `201`, so an outage or a power cut loses nothing. It
+lives at `/var/lib/watch-signals/spool.db` (the unit's `StateDirectory=`),
+outside the git checkout so re-cloning can't throw away undelivered data.
 
 ```bash
-# how many edges are waiting to go out? (0 = everything delivered)
+# how many edges are waiting to go out? (should stay in single digits)
 sudo sqlite3 /var/lib/watch-signals/spool.db 'SELECT COUNT(*) FROM pending;'
 
-# edges the API rejected permanently (a 4xx that isn't 408/429) -- these are
-# set aside so one bad record can't block the queue behind it. Should be empty;
-# anything here means the body or the machineId isn't what the API expects.
+# edges the API will never accept: listed under "rejected" in a batch reply,
+# or a 4xx (not 408/429) on the single-edge route. Set aside so one bad record
+# can't block the queue. Should be empty; anything here means the machineId or
+# body isn't what the API expects.
 sudo sqlite3 /var/lib/watch-signals/spool.db \
   'SELECT datetime(t,"unixepoch","localtime"), machine_id, event, reason FROM dead;'
 ```
 
-Each POST carries `occurredAt` -- when the PLC actually fired -- so a replayed
-edge reports its real time rather than its delivery time. The API requires UTC
-with a literal `Z`; a `+07:00` offset or bare Bangkok local time is rejected
-with a 400, so the timestamp is built as UTC explicitly and never from
-`datetime.now()`.
+The service also logs `queue length N` once a minute (`journalctl -u watch-signals
+| grep "queue length"`).
 
-That makes the Pi's clock part of the data path, and a Pi has no
-battery-backed clock. Confirm NTP is actually syncing:
+How each reply is handled:
+
+| Reply | What happens |
+|---|---|
+| `201` | Batch removed from the spool; anything under `rejected` moves to `dead` |
+| `400` | Logged loudly; those edges are sent one at a time to `/api/transactions` |
+| `404` on `/batch` | Server predates the feature: one at a time, `/batch` retried every `REST_BATCH_RECHECK` s (300) |
+| `401`/`403` | Logged as an ALERT; everything kept and retried -- fix `REST_API_KEY` |
+| `413` | Batch halved |
+| `429`, `5xx`, timeout, network error | Everything kept; same batch retried with backoff |
+
+Edges are always sent oldest first with one request in flight, because the
+server pairs rise/fall by order. Retries back off 1 s, 2 s, 4 s ... up to 30 s
+(`REST_RETRY_BASE` / `REST_RETRY_MAX`), and reset after a success. One
+keep-alive connection is reused; the request timeout is `REST_TIMEOUT` (10 s).
+If the spool exceeds `REST_QUEUE_MAX` (50,000 edges) the oldest are dropped in
+chunks and logged. `REST_SPOOL_PATH` moves the spool (e.g. to a USB stick, to
+spare the SD card).
+
+Each edge carries `occurredAt` -- when the PLC actually fired -- in UTC with a
+literal `Z` and milliseconds (a `+07:00` offset or bare Bangkok time is
+rejected). It is stored with the edge and never re-stamped, so a retry or a
+replay after a reboot sends the identical value; that is what lets the server
+skip edges it already stored (`duplicates` in the reply) instead of
+double-counting them.
+
+That makes the Pi's clock part of the data path, and a Pi has no battery-backed
+clock. Confirm NTP is actually syncing:
 
 ```bash
 timedatectl show -p NTPSynchronized -p TimeUSec
 ```
 
 `NTPSynchronized=yes` is what you want. If the clock is obviously unset (before
-2026) the sink omits `occurredAt` rather than sending a wrong one, and the
-server stamps the edge instead -- a degraded but honest result, logged once at
-startup. Worth knowing that a power cut while the uplink is also down is the
-case where this bites: the Pi boots with no idea what time it is and can't ask
-until WiFi returns.
-
-Retries back off from 5s to a maximum of 5 minutes between attempts. Both are
-tunable with `REST_RETRY_BASE` / `REST_RETRY_MAX` in `/etc/watch-signals.env`,
-along with `REST_SPOOL_PATH` if you'd rather the spool lived elsewhere (a USB
-stick, to spare the SD card).
+2026) `occurredAt` is omitted and the server stamps the edge instead -- logged
+once at startup. The batch route wants `occurredAt`, so a batch holding such an
+edge may be answered `400`, in which case those edges go one at a time as above.
 
 Sanity-check the whole thing by pointing the Pi at a dead endpoint for a
 minute -- `REST_BASE_URL=http://192.0.2.1:4000` in the env file, restart, watch
-`pending` grow in the journal, then put the real URL back and watch it drain.
+the queue length grow in the journal, then put the real URL back and watch it
+drain within about a minute.
+
+To confirm the lag is flat, run this on the VPS (average should stay under 2 s
+in every hour):
+
+```sql
+SELECT date_trunc('hour', received_at) AS hr,
+       round(avg(extract(epoch FROM received_at - occurred_at))::numeric, 1) AS avg_lag_s,
+       count(*) AS edges
+FROM transactions WHERE received_at > now() - interval '1 day' GROUP BY 1 ORDER BY 1;
+```
+
+Tests (fake API on localhost, no network needed):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## After a `git pull` with new code
 
