@@ -13,13 +13,13 @@ display and any configured sinks. The actual logic lives in plc/:
                    (add signals here)
   plc/display.py   terminal rendering
   plc/config.py    deployment settings (REST base URL, machine ID, ...)
-  plc/sinks.py     pluggable outputs -- CSV and a REST POST today; adding
+  plc/sinks.py     pluggable outputs -- CSV and batched REST today; adding
                    another is a new function there plus one line in
                    build_sinks() below, nothing else changes
 
   python3 watch_signals.py                  # live view
   python3 watch_signals.py --csv edges.csv  # also append every edge to CSV
-  python3 watch_signals.py --rest           # also POST every edge, see plc/config.py
+  python3 watch_signals.py --rest           # also send every edge in batches, see plc/config.py
   python3 watch_signals.py --rest --log-http 2>>http.log
                                             # ...and log every request/response
                                             # (stderr, so it doesn't fight the live view)
@@ -48,10 +48,10 @@ def build_sinks(args):
         if REST.log_requests:
             print(f"[rest_sink] logging every request to stderr "
                   f"(x-api-key {'set' if REST.api_key else 'NOT set'})", file=sys.stderr)
-        print(f"[rest_sink] posting to {REST.transactions_url} "
-              f"(machineId = each signal's name from plc/signals.py)")
-        print(f"[rest_sink] failed POSTs spool to {REST.spool_path} and replay "
-              f"when the API is reachable again")
+        print(f"[rest_sink] batching to {REST.batch_url}, up to {REST.batch_max} edges "
+              f"per request (machineId = each signal's name from plc/signals.py)")
+        print(f"[rest_sink] every edge is spooled to {REST.spool_path} first and removed "
+              f"only once the API confirms it")
     return sinks
 
 
@@ -61,7 +61,7 @@ def main():
     ap.add_argument("--port", type=int, default=8501)
     ap.add_argument("--csv", help="append one row per edge")
     ap.add_argument("--rest", action="store_true",
-                     help="POST every edge to REST_BASE_URL/api/transactions (see plc/config.py)")
+                     help="send every edge to REST_BASE_URL/api/transactions/batch (see plc/config.py)")
     ap.add_argument("--log-http", action="store_true",
                      help="log every REST request and response to stderr "
                           "(same as REST_LOG_REQUESTS=1)")

@@ -43,16 +43,24 @@ def _default_spool_path():
 class RestConfig:
     base_url: str = _env("REST_BASE_URL", "http://localhost:4000")
     api_key: str = _env("REST_API_KEY", "")
-    timeout: float = float(_env("REST_TIMEOUT", "3"))
+    timeout: float = float(_env("REST_TIMEOUT", "10"))
 
-    # Durable spool: edges whose POST failed are kept here and replayed when
-    # the API comes back, so an internet outage costs nothing.
+    # Durable spool: every edge is written here before any network attempt and
+    # removed only once the API confirms it, so an internet outage or a power
+    # cut costs nothing.
     spool_path: str = _env("REST_SPOOL_PATH", _default_spool_path())
-    # Backoff between replay attempts: starts at retry_base, doubles on each
-    # failed attempt, caps at retry_max. Defaults mean a long outage settles
-    # into one attempt every 5 minutes instead of hammering a dead endpoint.
-    retry_base: float = float(_env("REST_RETRY_BASE", "5"))
-    retry_max: float = float(_env("REST_RETRY_MAX", "300"))
+    # Most edges sent in one POST to /api/transactions/batch (server allows 500).
+    batch_max: int = int(_env("REST_BATCH_MAX", "200"))
+    # Cap on the spool. When it is full the oldest edges are dropped (in chunks,
+    # logged) so a very long outage can't fill the SD card.
+    queue_max: int = int(_env("REST_QUEUE_MAX", "50000"))
+    # Backoff between retries after a temporary failure: starts at retry_base,
+    # doubles on each failure, caps at retry_max, resets after a success.
+    retry_base: float = float(_env("REST_RETRY_BASE", "1"))
+    retry_max: float = float(_env("REST_RETRY_MAX", "30"))
+    # If the server answers 404 on /batch (older than the feature), edges go
+    # one at a time to /api/transactions and /batch is tried again this often.
+    batch_recheck: float = float(_env("REST_BATCH_RECHECK", "300"))
 
     # Log every outgoing POST (body, status, response, time) -- for tracking
     # down why one machine's edges never reach the API. Off by default so the
@@ -62,6 +70,10 @@ class RestConfig:
     @property
     def transactions_url(self):
         return f"{self.base_url.rstrip('/')}/api/transactions"
+
+    @property
+    def batch_url(self):
+        return f"{self.transactions_url}/batch"
 
 
 REST = RestConfig()

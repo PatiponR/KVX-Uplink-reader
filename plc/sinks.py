@@ -7,6 +7,7 @@ with the same shape (open/connect once, return a closure that does the work)
 and wire it up in watch_signals.py's build_sinks().
 """
 import csv
+import http.client
 import json
 import os
 import queue
@@ -14,8 +15,7 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 
 
 def csv_sink(path):
@@ -78,12 +78,12 @@ def _occurred_at(t):
 
 # --- durable spool for rest_sink -------------------------------------------
 #
-# `pending` is the retry queue: every edge the API hasn't accepted yet, oldest
-# first by id. `dead` is where edges go that the API will never accept (a 4xx
-# that isn't 408/429 -- a malformed body, an unknown machineId). Without that
-# split one poison edge would sit at the head of `pending` forever and block
-# every edge behind it, so a permanent rejection is set aside instead, still on
-# disk for you to inspect, and the queue keeps moving.
+# `pending` is the send queue: every edge the API hasn't confirmed yet, oldest
+# first by id. `dead` is where edges go that the API will never accept (it
+# listed them under "rejected", or answered a 4xx that isn't 408/429). Without
+# that split one poison edge would sit at the head of `pending` forever and
+# block every edge behind it, so a permanent rejection is set aside instead,
+# still on disk for you to inspect, and the queue keeps moving.
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending (
@@ -110,27 +110,13 @@ def _open_spool(path):
     conn = sqlite3.connect(path)
     # WAL so a reader/inspector can't block the writer; synchronous=FULL because
     # the whole point here is surviving power loss on a Pi that nobody is
-    # watching. Edges arrive seconds apart, so the extra fsync costs nothing.
+    # watching. Edges are written in groups (one commit per group), so the
+    # fsync cost is per burst, not per edge.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
-
-
-def _spool(conn, t, machine_id, event):
-    conn.execute("INSERT INTO pending (t, machine_id, event) VALUES (?, ?, ?)",
-                 (t, machine_id, event))
-    conn.commit()
-
-
-def _bury(conn, t, machine_id, event, reason, row_id=None):
-    conn.execute(
-        "INSERT INTO dead (t, machine_id, event, failed_at, reason) VALUES (?, ?, ?, ?, ?)",
-        (t, machine_id, event, time.time(), reason))
-    if row_id is not None:
-        conn.execute("DELETE FROM pending WHERE id = ?", (row_id,))
-    conn.commit()
 
 
 def _count(conn):
@@ -139,187 +125,364 @@ def _count(conn):
 
 def _one_line(data, limit=300):
     """A response body squeezed onto one line and capped, for log lines."""
-    text = " ".join(data.decode("utf-8", "replace").split())
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    text = " ".join(data.split())
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-def rest_sink(config):
-    """POST every edge to `{config.base_url}/api/transactions` as
-    {"machineId": edge.name, "edge": <event>, "occurredAt": <UTC ISO Z>},
-    with header
-    `x-api-key: {config.api_key}` when one is configured. <event> is
-    "rise"/"fall" for a plc/signals.py SIGNALS entry, or "service"/"operate"
-    for a SERVICE_SIGNALS entry (see plc/signals.py). The signal's own name
-    is used as the machineId, so each signal you add gets posted under its
-    own id automatically.
+def _log(msg):
+    print(f"[rest_sink] {msg}", file=sys.stderr)
 
-    Nothing is dropped when the API is unreachable. An edge whose POST fails
-    is written to a SQLite spool (config.spool_path) and retried with
-    exponential backoff, from config.retry_base up to config.retry_max seconds
-    between attempts, until it's accepted. The spool is on disk, so a reboot or
-    a crash mid-outage replays the backlog instead of losing it.
 
-    While any backlog exists, new edges go straight to the spool rather than
-    being posted directly -- otherwise a live edge would overtake the older
-    ones still waiting and the API would see them out of order.
+class _Http:
+    """POSTs over one kept-alive connection (a fresh TLS handshake per request
+    roughly doubles its cost over a ~80 ms link). Reconnects on demand; if a
+    connection that sat idle was closed by the server, the first send quietly
+    retries once on a fresh one. Only used from the sender thread."""
 
-    Runs on one background thread that owns the SQLite connection (so there's
-    no cross-thread sqlite3 sharing to get wrong); sink() only enqueues and
-    returns, so neither a slow API nor a long outage can stall the PLC polling
-    loop.
+    def __init__(self, headers, timeout):
+        self.headers = headers
+        self.timeout = timeout
+        self._conn = None
+        self._netloc = None
 
-    Every POST carries `occurredAt`: the moment the PLC actually fired, in the
-    UTC-with-Z format the API's validator requires (see _occurred_at above).
-    The spool stores that time alongside the edge, so a replay after a two-hour
-    outage still reports when the edge really happened rather than when it was
-    finally delivered.
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = None
 
-    With config.log_requests on, every POST is logged to stderr (the journal
-    under systemd) as one line: body, status, response and time taken. Edges
-    held back behind a backlog are logged too, so an edge that never shows up
-    in that log never reached this sink at all. Failures are logged either
-    way, including the API's response body.
-    """
-    url = config.transactions_url
-    headers = {"Content-Type": "application/json"}
-    if config.api_key:
-        headers["x-api-key"] = config.api_key
-    else:
-        print("[rest_sink] warning: REST_API_KEY is not set, posting without x-api-key",
-              file=sys.stderr)
-    q = queue.Queue()
+    def post(self, url, body):
+        """Returns (status, response_bytes). Raises on network errors/timeouts."""
+        parts = urllib.parse.urlsplit(url)
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        if self._netloc != parts.netloc:
+            self.close()
+            self._netloc = parts.netloc
+        for attempt in (0, 1):
+            reused = self._conn is not None
+            if not reused:
+                cls = (http.client.HTTPSConnection if parts.scheme == "https"
+                       else http.client.HTTPConnection)
+                self._conn = cls(parts.netloc, timeout=self.timeout)
+            try:
+                self._conn.request("POST", target, body=body, headers=self.headers)
+                resp = self._conn.getresponse()
+                data = resp.read()
+                if resp.will_close:
+                    self.close()
+                return resp.status, data
+            except ConnectionError:
+                self.close()
+                if reused and attempt == 0:
+                    continue
+                raise
+            except Exception:
+                self.close()
+                raise
 
-    def post(t, machine_id, event):
-        """Try one POST. Returns (delivered, permanent_reason). A non-None
-        reason means retrying can never succeed -- don't keep it queued."""
-        payload = {"machineId": machine_id, "edge": event}
+
+# Outcomes of one send attempt.
+_OK, _RETRY, _SINGLE, _SMALLER = "ok", "retry", "single", "smaller"
+
+# Edges are logged as dropped from a full spool in chunks of this size at most.
+_DROP_CHUNK = 1000
+# Longest the sender sleeps while edges are waiting, even if its backoff timer
+# says later -- a floor so a mis-computed deadline can never strand the queue.
+_RETRY_FLOOR = 15.0
+_STATS_EVERY = 60.0
+
+
+class _RestSender:
+    """The thread that owns the spool and talks to the API. See rest_sink."""
+
+    def __init__(self, config):
+        self.cfg = config
+        self.q = queue.Queue()
+        self.inbox = []             # taken off q, not yet committed to the spool
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["x-api-key"] = config.api_key
+        else:
+            _log("warning: REST_API_KEY is not set, posting without x-api-key")
+        self.http = _Http(headers, config.timeout)
+        self.conn = None
+        self.pending = 0
+        self.delay = config.retry_base
+        self.next_try = 0.0
+        self.batch_off_until = 0.0  # /batch answered 404: use the old route until then
+        self.cur_max = config.batch_max
+        self.failing = False
+        self.last_stats = time.monotonic()
+
+    # -- called from the polling thread --------------------------------------
+
+    def submit(self, edge):
+        self.q.put(edge)
+
+    # -- sender thread --------------------------------------------------------
+
+    def run(self):
+        self.conn = _open_spool(self.cfg.spool_path)
+        self.pending = _count(self.conn)
+        if self.pending:
+            _log(f"{self.pending} edge(s) left over from a previous run, sending")
+        while True:
+            try:
+                self.step()
+            except Exception as e:
+                # Never let the sender thread die: it would silently stop every
+                # edge from leaving this Pi until the service is restarted.
+                _log(f"unexpected error: {e!r}; continuing in 1s")
+                time.sleep(1)
+
+    def step(self):
+        now = time.monotonic()
+        if now - self.last_stats >= _STATS_EVERY:
+            self.last_stats = now
+            _log(f"queue length {self.pending}")
+        if self.pending:
+            wait = min(max(0.0, self.next_try - now), _RETRY_FLOOR)
+        else:
+            wait = max(0.0, _STATS_EVERY - (now - self.last_stats))
+        self.ingest(wait)
+        if self.pending and time.monotonic() >= self.next_try:
+            self.flush()
+
+    def ingest(self, wait):
+        """Move edges from the in-memory hand-off queue into the spool, as one
+        commit however many arrived. Blocks up to `wait` seconds for the first."""
+        try:
+            self.inbox.append(self.q.get(timeout=wait) if wait > 0 else self.q.get_nowait())
+        except queue.Empty:
+            if not self.inbox:
+                return
+        while True:
+            try:
+                self.inbox.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO pending (t, machine_id, event) VALUES (?, ?, ?)",
+                    [(e.t, e.name, e.event) for e in self.inbox])
+        except sqlite3.Error as e:
+            # Disk full / corrupt: keep the edges in memory and try again next
+            # loop rather than losing them.
+            _log(f"could not write {len(self.inbox)} edge(s) to the spool: {e}")
+            time.sleep(1)
+            return
+        self.pending += len(self.inbox)
+        self.inbox.clear()
+        if self.pending > self.cfg.queue_max:
+            self.enforce_cap()
+
+    def enforce_cap(self):
+        drop = min(self.pending - self.cfg.queue_max + max(1, self.cfg.queue_max // 10),
+                   _DROP_CHUNK, self.pending)
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM pending WHERE id IN "
+                "(SELECT id FROM pending ORDER BY id LIMIT ?)", (drop,))
+        self.pending -= drop
+        _log(f"spool is full ({self.cfg.queue_max} edges): dropped the {drop} oldest")
+
+    # -- sending ---------------------------------------------------------------
+
+    def flush(self):
+        rows = self.conn.execute(
+            "SELECT id, t, machine_id, event FROM pending ORDER BY id LIMIT ?",
+            (self.cur_max,)).fetchall()
+        if not rows:
+            self.pending = 0
+            return
+        if time.monotonic() < self.batch_off_until:
+            outcome = _SINGLE
+        else:
+            outcome = self.send_batch(rows)
+        if outcome == _SINGLE:
+            outcome = self.send_singles(rows)
+
+        if outcome == _OK:
+            if self.failing:
+                self.failing = False
+                _log(f"delivered again, {self.pending} edge(s) still queued")
+            self.delay = self.cfg.retry_base
+            self.next_try = 0.0
+            self.cur_max = min(self.cfg.batch_max, self.cur_max * 2)
+        elif outcome == _SMALLER:
+            self.cur_max = max(1, len(rows) // 2)
+            self.next_try = 0.0
+        else:
+            self.failing = True
+            self.next_try = time.monotonic() + self.delay
+            _log(f"{self.pending} edge(s) queued, retrying in {self.delay:g}s")
+            self.delay = min(self.delay * 2, self.cfg.retry_max)
+
+    def remove(self, delivered_ids, dead=()):
+        """Atomically drop confirmed edges from `pending`, setting aside `dead`
+        ((row, reason) pairs) in the dead table."""
+        with self.conn:
+            if dead:
+                self.conn.executemany(
+                    "INSERT INTO dead (t, machine_id, event, failed_at, reason) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(r[1], r[2], r[3], time.time(), reason) for r, reason in dead])
+            ids = list(delivered_ids) + [r[0] for r, _ in dead]
+            cur = self.conn.executemany("DELETE FROM pending WHERE id = ?",
+                                        [(i,) for i in ids])
+        # rowcount, not len(ids): a full-spool drop may have removed some already.
+        self.pending -= cur.rowcount
+
+    @staticmethod
+    def event_dict(row):
+        _, t, machine_id, event = row
+        d = {"machineId": machine_id, "edge": event}
         occurred_at = _occurred_at(t)
         if occurred_at:
-            payload["occurredAt"] = occurred_at
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+            d["occurredAt"] = occurred_at
+        return d
+
+    def send_batch(self, rows):
+        url = self.cfg.batch_url
+        body = json.dumps({"events": [self.event_dict(r) for r in rows]}).encode()
         started = time.monotonic()
-
-        def log(outcome, response=b""):
-            # One line per request with the machineId in it, so
-            # `journalctl -u watch-signals | grep TMC-400` is that machine's history.
-            ms = (time.monotonic() - started) * 1000
-            print(f"[http] POST {url} {body.decode()} -> {outcome} in {ms:.0f} ms"
-                  + (f": {_one_line(response)}" if response else ""), file=sys.stderr)
-
         try:
-            with urllib.request.urlopen(req, timeout=config.timeout) as r:
-                response = r.read()
-            if config.log_requests:
-                # urllib follows a 301/302 by re-sending as a GET without the
-                # body -- a "success" that created nothing. Make that visible.
-                moved = f" (redirected to {r.url})" if r.url != url else ""
-                log(f"HTTP {r.status}{moved}", response)
-            return True, None
-        except urllib.error.HTTPError as e:
-            try:
-                response = e.read()
-            except Exception:
-                response = b""
-            if config.log_requests:
-                log(f"HTTP {e.code}", response)
-            # 408/429 are "try again"; every other 4xx means this exact body
-            # will be rejected forever, however long we wait. Keep the API's
-            # own explanation -- it's what tells you what's wrong with the body.
-            if 400 <= e.code < 500 and e.code not in (408, 429):
-                return False, (f"HTTP {e.code}: {_one_line(response)}" if response else f"HTTP {e.code}")
-            if not config.log_requests:
-                print(f"[rest_sink] POST to {url} failed: HTTP {e.code}"
-                      + (f": {_one_line(response)}" if response else ""), file=sys.stderr)
-            return False, None
+            status, resp = self.http.post(url, body)
         except Exception as e:
-            if config.log_requests:
-                log(f"failed ({e})")
-            else:
-                print(f"[rest_sink] POST to {url} failed: {e}", file=sys.stderr)
-            return False, None
+            self.log_request(url, len(rows), f"failed ({e})", b"", started, always=True)
+            return _RETRY
+        self.log_request(url, len(rows), f"HTTP {status}", resp, started,
+                         always=(status != 201))
 
-    def drain(conn):
-        """Replay spooled edges oldest-first until one fails or none are left.
-        Returns how many were delivered."""
-        sent = 0
-        while True:
-            row = conn.execute(
-                "SELECT id, t, machine_id, event FROM pending ORDER BY id LIMIT 1").fetchone()
-            if row is None:
-                return sent
-            row_id, t, machine_id, event = row
-            delivered, permanent = post(t, machine_id, event)
-            if delivered:
-                conn.execute("DELETE FROM pending WHERE id = ?", (row_id,))
-                conn.commit()
-                sent += 1
-            elif permanent:
-                print(f"[rest_sink] {machine_id}/{event} rejected permanently "
-                      f"({permanent}), moved to the dead table", file=sys.stderr)
-                _bury(conn, t, machine_id, event, permanent, row_id)
-            else:
-                return sent
-
-    def worker():
-        conn = _open_spool(config.spool_path)
-        backlog = _count(conn)
-        if backlog:
-            print(f"[rest_sink] {backlog} edge(s) left over from a previous run, replaying",
-                  file=sys.stderr)
-        delay = config.retry_base
-        next_try = time.monotonic()
-
-        while True:
-            # Block for a new edge, but no longer than the next retry deadline
-            # when there's a backlog waiting to go out.
-            timeout = max(0.0, next_try - time.monotonic()) if backlog else None
+        if status == 201:
+            rejected = {}
             try:
-                edge = q.get(timeout=timeout)
-            except queue.Empty:
-                edge = None
+                for item in json.loads(resp).get("rejected") or []:
+                    rejected[int(item["index"])] = str(item.get("error", "rejected"))
+            except Exception as e:
+                _log(f"batch stored, but the reply could not be read ({e}); "
+                     f"treating all {len(rows)} as accepted")
+            dead = []
+            for idx, reason in sorted(rejected.items()):
+                if 0 <= idx < len(rows):
+                    r = rows[idx]
+                    _log(f"{r[2]}/{r[3]} rejected permanently ({reason}), "
+                         f"moved to the dead table")
+                    dead.append((r, f"batch: {reason}"))
+            dead_ids = {r[0] for r, _ in dead}
+            self.remove([r[0] for r in rows if r[0] not in dead_ids], dead)
+            return _OK
+        if status == 400:
+            _log(f"ERROR: API rejected the batch request shape (HTTP 400: "
+                 f"{_one_line(resp)}); sending these {len(rows)} edge(s) one at a time")
+            return _SINGLE
+        if status == 404:
+            self.batch_off_until = time.monotonic() + self.cfg.batch_recheck
+            _log(f"{url} not found (server older than the batch feature?); using "
+                 f"{self.cfg.transactions_url} one edge at a time, "
+                 f"trying /batch again in {self.cfg.batch_recheck:g}s")
+            return _SINGLE
+        if status == 413:
+            if len(rows) > 1:
+                _log(f"batch of {len(rows)} too large (HTTP 413), halving")
+                return _SMALLER
+            return _SINGLE
+        if status in (401, 403):
+            _log(f"ALERT: API refused the key (HTTP {status}); nothing is being "
+                 f"delivered until REST_API_KEY is fixed. {self.pending} edge(s) kept.")
+            return _RETRY
+        # 429, 5xx, a redirect or captive-portal page, anything else: temporary.
+        return _RETRY
 
-            if edge is not None:
-                if backlog:
-                    _spool(conn, edge.t, edge.name, edge.event)
-                    backlog += 1
-                    if config.log_requests:
-                        print(f"[http] {edge.name}/{edge.event} not sent yet: queued behind "
-                              f"{backlog - 1} spooled edge(s)", file=sys.stderr)
-                else:
-                    delivered, permanent = post(edge.t, edge.name, edge.event)
-                    if permanent:
-                        print(f"[rest_sink] {edge.name}/{edge.event} rejected permanently "
-                              f"({permanent}), moved to the dead table", file=sys.stderr)
-                        _bury(conn, edge.t, edge.name, edge.event, permanent)
-                    elif not delivered:
-                        _spool(conn, edge.t, edge.name, edge.event)
-                        backlog = _count(conn)
-                        delay = config.retry_base
-                        next_try = time.monotonic() + delay
-                        print(f"[rest_sink] spooled {edge.name}/{edge.event}, "
-                              f"retrying in {delay:g}s", file=sys.stderr)
-                q.task_done()
-                continue
-
-            # Retry deadline reached with a backlog: try to flush it.
-            sent = drain(conn)
-            backlog = _count(conn)
-            if backlog:
-                delay = min(delay * 2, config.retry_max)
-                next_try = time.monotonic() + delay
-                if sent:
-                    print(f"[rest_sink] replayed {sent}, {backlog} still queued, "
-                          f"retrying in {delay:g}s", file=sys.stderr)
+    def send_singles(self, rows):
+        """Old one-edge-per-POST route, strictly in order. Stops at the first
+        temporary failure. Keeps taking edges off the hand-off queue between
+        requests so a slow fallback never leaves them only in memory."""
+        url = self.cfg.transactions_url
+        for row in rows:
+            body = json.dumps(self.event_dict(row)).encode()
+            started = time.monotonic()
+            try:
+                status, resp = self.http.post(url, body)
+            except Exception as e:
+                self.log_request(url, 1, f"failed ({e})", b"", started, always=True)
+                return _RETRY
+            self.log_request(url, 1, f"HTTP {status}", resp, started,
+                             always=not (200 <= status < 300))
+            if 200 <= status < 300:
+                self.remove([row[0]])
+            elif status in (401, 403):
+                _log(f"ALERT: API refused the key (HTTP {status}); edges kept.")
+                return _RETRY
+            elif 400 <= status < 500 and status not in (408, 429):
+                reason = f"HTTP {status}: {_one_line(resp)}" if resp else f"HTTP {status}"
+                _log(f"{row[2]}/{row[3]} rejected permanently ({reason}), "
+                     f"moved to the dead table")
+                self.remove([], [(row, reason)])
             else:
-                if sent:
-                    print(f"[rest_sink] backlog cleared, {sent} edge(s) replayed",
-                          file=sys.stderr)
-                delay = config.retry_base
+                return _RETRY
+            self.ingest(0)
+        return _OK
 
-    threading.Thread(target=worker, daemon=True, name="rest_sink").start()
+    def log_request(self, url, n, outcome, resp, started, always):
+        if not (always or self.cfg.log_requests):
+            return
+        ms = (time.monotonic() - started) * 1000
+        print(f"[http] POST {url} ({n} edge{'s' if n != 1 else ''}) -> {outcome} "
+              f"in {ms:.0f} ms" + (f": {_one_line(resp)}" if resp else ""),
+              file=sys.stderr)
 
-    def sink(edge):
-        q.put(edge)
 
-    return sink
+def rest_sink(config):
+    """Send every edge to the API as
+    {"machineId": edge.name, "edge": <event>, "occurredAt": <UTC ISO Z>}.
+    <event> is "rise"/"fall" for a plc/signals.py SIGNALS entry, or
+    "service"/"operate" for a SERVICE_SIGNALS entry. The signal's own name is
+    the machineId, so each signal you add is sent under its own id.
+
+    Edges are sent in batches to `POST /api/transactions/batch` (one request
+    carries everything waiting, up to config.batch_max), because one request per
+    edge caps throughput at ~1/round-trip (about 12 edges/s on the Singapore
+    link) and the dashboard falls ever further behind. See
+    PI-SENDER-BATCH-REQUIREMENTS.md for the contract; R-numbers below refer to it.
+
+    sink() only hands the edge to a background thread and returns, so neither a
+    slow API nor a long outage can stall the PLC polling loop. That thread:
+
+      * writes every edge to the SQLite spool (config.spool_path) before any
+        network attempt (R2), one commit per burst; the spool is on disk, so a
+        reboot or crash replays the backlog instead of losing it;
+      * sends the oldest edges first, one request in flight, skipping nothing
+        past a failed batch (R4), and starts the next request the moment the
+        previous one finishes if anything is waiting -- no timer to "fill" a
+        batch (R5);
+      * removes edges from the spool only after the API answers 201 (R6);
+        edges listed under "rejected" can never succeed and move to the `dead`
+        table instead;
+      * retries temporary failures with backoff from config.retry_base doubling
+        up to config.retry_max, reset after a success (R7);
+      * reuses one keep-alive connection with config.timeout per request (R8);
+      * caps the spool at config.queue_max, dropping the oldest in chunks (R9);
+      * logs the queue length once a minute (R11).
+
+    occurredAt is the moment the PLC edge was read, in UTC with a literal Z (see
+    _occurred_at). The spool stores that time, and it is formatted from the
+    stored value each time, so a retry or a replay after a reboot sends the
+    identical string and the API can skip anything it already stored (R1).
+
+    HTTP 400 on the batch route falls back to sending those edges one at a time
+    to /api/transactions; 404 does the same and re-tries /batch every
+    config.batch_recheck seconds. The full response table is in send_batch().
+
+    With config.log_requests on, every request is logged to stderr (the journal
+    under systemd): edge count, status, response and time taken. Failures are
+    logged either way.
+    """
+    sender = _RestSender(config)
+    threading.Thread(target=sender.run, daemon=True, name="rest_sink").start()
+    return sender.submit
